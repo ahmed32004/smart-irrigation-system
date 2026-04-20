@@ -1,0 +1,246 @@
+// ==========================================
+// 1. الإعدادات الأساسية والمكتبات وبيانات الاتصال
+// ==========================================
+#define BLYNK_TEMPLATE_ID "TMPL2rlNxHu3F"
+#define BLYNK_TEMPLATE_NAME "smart irrigation system"
+#define BLYNK_AUTH_TOKEN "CBCMxhnesutJCu2kOiCgMAW5ns5WIngb"
+
+#include <WiFi.h>
+#include <BlynkSimpleEsp32.h>
+#include <DHT.h> 
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h> 
+#include <FirebaseESP32.h> 
+
+char ssid[] = "andro";
+char pass[] = "12345678";
+
+// تم وضع رابط الفايربيز الخاص بك بدون https:// 
+#define FIREBASE_HOST "smart-irrigation-adadc-default-rtdb.europe-west1.firebasedatabase.app"
+#define FIREBASE_AUTH "w497zhf9a0WifL8upEBPmsc9XIdPaxcpVnznksPq"
+
+FirebaseData firebaseData;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ==========================================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ==========================================
+#define SOIL_PIN 34
+#define LDR_PIN 35
+#define PUMP_PIN 26
+#define BUTTON_PIN 14 // بن الزرار
+
+#define DHT_PIN 4 
+#define DHTTYPE DHT11 
+DHT dht(DHT_PIN, DHTTYPE);
+
+bool autoMode = false;   
+bool manualPump = false; 
+BlynkTimer timer;
+
+const int AIR_VALUE = 4095;
+const int WATER_VALUE = 1150;
+
+const int DRY_PERCENT = 40;
+const int WET_PERCENT = 75;
+
+const float MAX_TEMP_WATERING = 30.0; 
+const int MAX_LIGHT_WATERING = 40;  
+
+volatile int global_soilPercent = 0;
+volatile int global_ldrPercent = 0;
+volatile float global_temp = 0.0;
+volatile float global_hum = 0.0;
+volatile bool global_pumpState = false; 
+
+// ==========================================
+unsigned long buttonPressTime = 0;
+bool isButtonPressed = false;
+bool isLongPressHandled = false;
+const unsigned long longPressThreshold = 400; 
+
+// ==========================================
+int getReading(int pin) {
+  long sum = 0;
+  for(int i = 0; i < 10; i++) { sum += analogRead(pin); delay(2); }
+  return sum / 10;
+}
+
+void updateScreen() {
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("T:"); lcd.print((int)global_temp);
+  lcd.print(" H:"); lcd.print((int)global_hum);
+  lcd.print(" L:"); lcd.print(global_ldrPercent);
+
+  lcd.setCursor(0, 1);
+  lcd.print("S:"); lcd.print(global_soilPercent); lcd.print("% ");
+  lcd.print("P:"); 
+  lcd.print(global_pumpState ? "ON" : "OFF");
+  lcd.print(autoMode ? "[A]" : "[M]");
+}
+
+// ==========================================
+// الدالة الجديدة لرفع البيانات للفايربيز
+// ==========================================
+void uploadToFirebase() {
+  if (Firebase.ready()) {
+    String statusStr = global_pumpState ? "ON" : "OFF";
+    
+    FirebaseJson json;
+    json.set("soil", global_soilPercent);
+    json.set("light", global_ldrPercent);
+    json.set("temp", global_temp);
+    json.set("hum", global_hum);
+    json.set("pump", statusStr);
+
+    if (Firebase.pushJSON(firebaseData, "/SensorReadings", json)) {
+      Serial.println("✅ Data successfully pushed to Firebase!");
+    } else {
+      Serial.print("❌ Firebase Error: ");
+      Serial.println(firebaseData.errorReason());
+    }
+  }
+}
+
+// ==========================================
+void smartLogic() {
+  int rawSoil = getReading(SOIL_PIN); 
+  global_soilPercent = constrain(map(rawSoil, AIR_VALUE, WATER_VALUE, 0, 100), 0, 100);
+  
+  int rawLdr = getReading(LDR_PIN);
+  global_ldrPercent = constrain(map(rawLdr, 0, 4095, 0, 100), 0, 100);
+
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  if (!isnan(h) && !isnan(t)) {
+    global_hum = h; global_temp = t;
+  }
+
+  Blynk.virtualWrite(V2, global_soilPercent);
+  Blynk.virtualWrite(V3, global_ldrPercent); 
+  Blynk.virtualWrite(V4, global_temp); 
+  Blynk.virtualWrite(V5, global_hum); 
+  
+  if (manualPump == true) {
+    digitalWrite(PUMP_PIN, LOW); 
+  } else if (autoMode == false) {
+    digitalWrite(PUMP_PIN, HIGH); 
+  } else {
+
+    bool isSoilDry = (global_soilPercent < DRY_PERCENT);     
+    bool isSoilWet = (global_soilPercent > WET_PERCENT);     
+    bool isTempHigh = (global_temp > MAX_TEMP_WATERING);     
+    bool isLightHigh = (global_ldrPercent >= MAX_LIGHT_WATERING);
+
+    if (isTempHigh) {
+      digitalWrite(PUMP_PIN, HIGH);
+    }
+    else if (isLightHigh) {
+      digitalWrite(PUMP_PIN, HIGH);
+    }
+    else if (isSoilDry) {
+      digitalWrite(PUMP_PIN, LOW);
+    }
+    else if (isSoilWet) {
+      digitalWrite(PUMP_PIN, HIGH);
+    }
+    else {
+      digitalWrite(PUMP_PIN, HIGH);
+    }
+  }
+
+  global_pumpState = (digitalRead(PUMP_PIN) == LOW);
+  updateScreen();
+}
+
+// ==========================================
+void handleButton() {
+  int reading = digitalRead(BUTTON_PIN);
+
+  if (reading == LOW && !isButtonPressed) {
+    isButtonPressed = true;
+    buttonPressTime = millis();
+    isLongPressHandled = false;
+    
+  } else if (reading == LOW && isButtonPressed) {
+    if (!autoMode && (millis() - buttonPressTime > longPressThreshold)) {
+      if (!isLongPressHandled) {
+        manualPump = true;         
+        smartLogic();              
+        Blynk.virtualWrite(V1, 1); 
+        isLongPressHandled = true;
+      }
+    }
+    
+  } else if (reading == HIGH && isButtonPressed) {
+    isButtonPressed = false;
+    unsigned long pressDuration = millis() - buttonPressTime;
+
+    if (isLongPressHandled) {
+      manualPump = false;        
+      smartLogic();              
+      Blynk.virtualWrite(V1, 0); 
+    } else {
+      if (pressDuration > 50) {
+        autoMode = !autoMode;    
+        manualPump = false;      
+        smartLogic();            
+        Blynk.virtualWrite(V0, autoMode); 
+        Blynk.virtualWrite(V1, 0);
+      }
+    }
+  }
+}
+
+// ==========================================
+BLYNK_CONNECTED() {
+  Blynk.syncVirtual(V0); 
+  Blynk.syncVirtual(V1); 
+}
+
+void setup() {
+  Serial.begin(115200); 
+  delay(1000); 
+  
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, HIGH); 
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP); 
+  
+  dht.begin(); 
+  Wire.begin();
+  
+  lcd.begin();                     
+  lcd.backlight();                 
+  lcd.setCursor(0, 0);             
+  lcd.print("System Starting.");   
+
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  // تشغيل دالة smartLogic كل ثانية (1000 مللي ثانية)
+  timer.setInterval(1000L, smartLogic); 
+  
+  // تشغيل دالة uploadToFirebase كل 30 ثانية (30000 مللي ثانية)
+  timer.setInterval(30000L, uploadToFirebase); 
+
+  // تم حذف الـ xTaskCreatePinnedToCore لتفادي مشاكل الـ Cores
+}
+
+// ==========================================
+void loop() {
+  Blynk.run(); 
+  timer.run();
+  handleButton(); 
+}
+
+BLYNK_WRITE(V0) { autoMode = param.asInt(); smartLogic(); }
+BLYNK_WRITE(V1) { manualPump = param.asInt(); smartLogic(); }

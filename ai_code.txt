@@ -1,0 +1,85 @@
+import requests
+import time
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+import warnings
+import os
+
+warnings.filterwarnings('ignore')
+
+FIREBASE_URL = "https://smart-irrigation-adadc-default-rtdb.europe-west1.firebasedatabase.app/SensorReadings.json"
+BLYNK_TOKEN = "CBCMxhnesutJCu2kOiCgMAW5ns5WIngb"
+BLYNK_API_URL = "https://blynk.cloud/external/api/update"
+
+print("⚙️ Loading Historical Brain Data...")
+
+if os.path.exists('irrigation_history.csv'):
+    training_data = pd.read_csv('irrigation_history.csv')
+    print("✅ Loaded real patterns from CSV file.")
+else:
+    print("⚠️ CSV not found! Using default pattern...")
+    training_data = pd.DataFrame({
+        'temp': np.random.uniform(15, 45, 1000),
+        'hum': np.random.uniform(20, 80, 1000),
+        'light': np.random.uniform(0, 100, 1000),
+        'soil': np.random.uniform(0, 100, 1000),
+        'needs_water': np.random.randint(0, 2, 1000)
+    })
+
+X = training_data[['temp', 'hum', 'light', 'soil']]
+y = training_data['needs_water']
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+ai_model = RandomForestClassifier(n_estimators=100, random_state=42)
+ai_model.fit(X_train, y_train)
+
+print(f"✅ AI Brain Ready! Accuracy: {ai_model.score(X_test, y_test)*100:.2f}%")
+print("=" * 50)
+
+def predict_realtime():
+    print("🔄 Fetching live sensor data...")
+    try:
+        response = requests.get(FIREBASE_URL)
+        data = response.json()
+
+        if not data:
+            print("❌ No data found.")
+            return
+
+        records = list(data.values())
+        latest = records[-1]
+
+        live_data = pd.DataFrame({
+            'temp': [latest['temp']],
+            'hum': [latest['hum']],
+            'light': [latest['light']],
+            'soil': [latest['soil']]
+        })
+
+        prediction = ai_model.predict(live_data)[0]
+        probability = ai_model.predict_proba(live_data)[0][1] * 100
+
+        if prediction == 1:
+            decision = "يحتاج ري"
+            status = f"جفاف: {probability:.1f}% ⚠️"
+        else:
+            decision = "لا يحتاج ري"
+            status = f"رطب: {100 - probability:.1f}% 💧"
+
+        print(f"🤖 Decision: {decision} | Status: {status}")
+
+        requests.get(f"{BLYNK_API_URL}?token={BLYNK_TOKEN}&v10={status}")
+        requests.get(f"{BLYNK_API_URL}?token={BLYNK_TOKEN}&v11={decision}")
+
+        print("📲 Sync Complete.")
+        print("-" * 50)
+
+    except Exception as e:
+        print(f"❌ Error: {e}")
+
+print("🚀 AI System Started...")
+while True:
+    predict_realtime()
+    time.sleep(30)
